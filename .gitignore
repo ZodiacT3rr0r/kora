@@ -1,0 +1,37 @@
+# Go binaries
+kora
+
+# Go build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Go test binaries
+*.test
+
+# Go coverage
+*.out
+*.cover
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build directories
+bin/
+dist/
+
+# Temporary files
+*.tmp
+
+# Go mod/sum files (only if vendoring)
+# vendor/
+
+# OS-specific
+.env
+.env.local
