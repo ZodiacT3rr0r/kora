@@ -6,19 +6,19 @@ Kora is a complete, self-contained database engine that demonstrates modern stor
 
 ## Features
 
-✅ **Redis-Compatible RESP Protocol** — any Redis client (`redis-cli`, client libraries, etc.) can interact with Kora directly.
+**Redis-Compatible RESP Protocol** — any Redis client (`redis-cli`, client libraries, etc.) can interact with Kora directly.
 
-✅ **Persistent Durability** — Write-Ahead Log ensures data survives process crashes and system failures.
+**Persistent Durability** — Write-Ahead Log ensures data survives process crashes and system failures.
 
-✅ **High Write Throughput** — Sequential log writes and batched in-memory buffering optimize for write-heavy workloads.
+**High Write Throughput** — Sequential log writes and batched in-memory buffering optimize for write-heavy workloads.
 
-✅ **Efficient Point Lookups** — Bloom filters and compaction keep read amplification bounded even at scale.
+**Efficient Point Lookups** — Bloom filters and compaction keep read amplification bounded even at scale.
 
-✅ **TTL / Expiration** — Built-in key expiration with nanosecond precision.
+**TTL / Expiration** — Built-in key expiration with nanosecond precision.
 
-✅ **Crash Recovery** — Automatic WAL replay on startup restores exact state without data loss.
+**Crash Recovery** — Automatic WAL replay on startup restores exact state without data loss.
 
-✅ **Concurrent Access** — Safe concurrent reads and writes via RWMutex and goroutine-based background tasks.
+**Concurrent Access** — Safe concurrent reads and writes via RWMutex and goroutine-based background tasks.
 
 ## Supported Commands
 
