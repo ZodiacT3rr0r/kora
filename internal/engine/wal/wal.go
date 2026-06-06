@@ -43,6 +43,13 @@ func Open(path string) (*WAL, error) {
 	return &WAL{f: f, path: path, offset: off}, nil
 }
 
+// Path returns the WAL file path.
+func (w *WAL) Path() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.path
+}
+
 // Close closes the underlying file.
 func (w *WAL) Close() error {
 	w.mu.Lock()
