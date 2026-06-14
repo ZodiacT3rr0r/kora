@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -263,7 +264,7 @@ func (e *Engine) FlushOnce() error {
 	// For each immutable memtable, write an SSTable file.
 	for idx, mt := range imm {
 		// Build filename
-		fname := filepath.Join(e.dataDir, "sstable-"+time.Now().Format("20060102T150405")+"-"+string(rune(idx))+".sst")
+		fname := filepath.Join(e.dataDir, fmt.Sprintf("sstable-%s-%d.sst", time.Now().Format("20060102T150405"), idx))
 		w, err := sstable.NewWriter(fname)
 		if err != nil {
 			return err
