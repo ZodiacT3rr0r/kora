@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"kora/internal/engine"
+	"kora/internal/engine/compaction"
 	"kora/internal/engine/manifest"
 	"kora/internal/engine/memtable"
 	"kora/internal/engine/sstable"
@@ -37,6 +38,7 @@ type Engine struct {
 	syncOnWrite     bool
 	memTableMaxSize int64
 	dataDir         string
+	scheduler       *compaction.Scheduler
 }
 
 func Open(opts Options) (*Engine, error) {
@@ -76,6 +78,7 @@ func Open(opts Options) (*Engine, error) {
 		syncOnWrite:     opts.SyncOnWrite,
 		memTableMaxSize: opts.MemTableMaxSize,
 		dataDir:         opts.DataDir,
+		scheduler:       compaction.NewScheduler(),
 	}
 
 	if err := e.recoverFromWAL(); err != nil {
@@ -372,6 +375,46 @@ func (e *Engine) FlushOnce() error {
 	e.mu.Lock()
 	e.wal = w2
 	e.mu.Unlock()
+	return nil
+}
+
+// Compact attempts to compact Level 0 files if a compaction job is needed.
+// It executes the compaction job and updates the manifest accordingly.
+func (e *Engine) Compact() error {
+	e.mu.RLock()
+	files := e.manifest.List()
+	sched := e.scheduler
+	dataDir := e.dataDir
+	e.mu.RUnlock()
+
+	// Select a compaction job
+	job := sched.SelectCompactionJob(files, dataDir)
+	if job == nil {
+		return nil // no compaction needed
+	}
+
+	// Execute the compaction job
+	outMeta, err := compaction.ExecuteCompactionJob(job)
+	if err != nil {
+		return err
+	}
+
+	// Update manifest: add new file and remove old files
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Add the new compacted file
+	if err := e.manifest.Add(outMeta); err != nil {
+		return err
+	}
+
+	// Remove the input files from manifest
+	for _, inMeta := range job.InputFiles {
+		if err := e.manifest.Remove(inMeta.File); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
