@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"kora/internal/engine"
+	"kora/internal/engine/bloom"
 	"kora/internal/util"
 )
 
@@ -48,7 +49,6 @@ func (w *Writer) Add(e *engine.Entry) error {
 	if w.closed {
 		return errors.New("writer closed")
 	}
-	// position where record will be written
 	pos, err := w.f.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
@@ -69,7 +69,6 @@ func (w *Writer) Add(e *engine.Entry) error {
 		return err
 	}
 	w.offsets = append(w.offsets, pos)
-	// store a copy of key
 	kcopy := make([]byte, len(e.Key))
 	copy(kcopy, e.Key)
 	w.keys = append(w.keys, kcopy)
@@ -82,16 +81,19 @@ func (w *Writer) Close() error {
 	if w.closed {
 		return nil
 	}
-	// write index
 	idxOff, err := w.f.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
-	// build index bytes
-	// sort keys with offsets by key
-	pairs := make([]struct{ key []byte; off int64 }, len(w.keys))
+	pairs := make([]struct {
+		key []byte
+		off int64
+	}, len(w.keys))
 	for i := range w.keys {
-		pairs[i] = struct{ key []byte; off int64 }{key: w.keys[i], off: w.offsets[i]}
+		pairs[i] = struct {
+			key []byte
+			off int64
+		}{key: w.keys[i], off: w.offsets[i]}
 	}
 	sort.Slice(pairs, func(i, j int) bool { return bytes.Compare(pairs[i].key, pairs[j].key) < 0 })
 	var buf bytes.Buffer
@@ -108,7 +110,6 @@ func (w *Writer) Close() error {
 	if _, err := w.f.Write(indexBytes); err != nil {
 		return err
 	}
-	// write footer: indexOffset (8), indexLen (4), crc32 (4)
 	var footer [16]byte
 	binary.LittleEndian.PutUint64(footer[0:8], uint64(idxOff))
 	binary.LittleEndian.PutUint32(footer[8:12], uint32(len(indexBytes)))
@@ -123,14 +124,15 @@ func (w *Writer) Close() error {
 	return w.f.Close()
 }
 
-// Reader provides read-only access to an SSTable file.
+// Reader provides read-only indexed and Bloom-filtered access to an SSTable file.
 type Reader struct {
 	mu        sync.RWMutex
 	f         *os.File
 	path      string
 	indexKeys [][]byte
 	offsets   []int64
-	dataEnd   int64 // offset where data region ends (indexOffset)
+	bloom     *bloom.BloomFilter
+	dataEnd   int64
 }
 
 func Open(path string) (*Reader, error) {
@@ -138,7 +140,6 @@ func Open(path string) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	// read footer
 	fi, err := f.Stat()
 	if err != nil {
 		f.Close()
@@ -149,7 +150,6 @@ func Open(path string) (*Reader, error) {
 		f.Close()
 		return nil, errors.New("file too small to be sstable")
 	}
-	// read last 16 bytes
 	if _, err := f.Seek(sz-16, io.SeekStart); err != nil {
 		f.Close()
 		return nil, err
@@ -166,7 +166,6 @@ func Open(path string) (*Reader, error) {
 		f.Close()
 		return nil, errors.New("invalid index")
 	}
-	// read index bytes
 	if _, err := f.Seek(idxOff, io.SeekStart); err != nil {
 		f.Close()
 		return nil, err
@@ -180,7 +179,6 @@ func Open(path string) (*Reader, error) {
 		f.Close()
 		return nil, errors.New("index crc mismatch")
 	}
-	// parse index
 	var keys [][]byte
 	var offs []int64
 	off := 0
@@ -203,7 +201,25 @@ func Open(path string) (*Reader, error) {
 		keys = append(keys, k)
 		offs = append(offs, offset)
 	}
-	return &Reader{f: f, path: path, indexKeys: keys, offsets: offs, dataEnd: idxOff}, nil
+
+	bf := bloom.New(uint64(len(keys)), 0.01)
+	for _, k := range keys {
+		bf.Add(k)
+	}
+
+	return &Reader{
+		f:         f,
+		path:      path,
+		indexKeys: keys,
+		offsets:   offs,
+		bloom:     bf,
+		dataEnd:   idxOff,
+	}, nil
+}
+
+// Bloom returns the SSTable's populated BloomFilter for fast negative-lookup caching.
+func (r *Reader) Bloom() *bloom.BloomFilter {
+	return r.bloom
 }
 
 func (r *Reader) Close() error {
@@ -217,10 +233,13 @@ func (r *Reader) Close() error {
 	return err
 }
 
-// Get returns the entry for a key, or ErrNotFound.
+// Get returns the entry for a key using Bloom filter pre-check + O(log n) binary search, or ErrNotFound.
 func (r *Reader) Get(key []byte) (*engine.Entry, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if r.bloom != nil && !r.bloom.MightContain(key) {
+		return nil, ErrNotFound
+	}
 	idx := sort.Search(len(r.indexKeys), func(i int) bool { return bytes.Compare(r.indexKeys[i], key) >= 0 })
 	if idx < len(r.indexKeys) && bytes.Equal(r.indexKeys[idx], key) {
 		return r.readAtOffset(r.offsets[idx])
@@ -291,9 +310,6 @@ func (it *Iterator) Next() bool {
 		it.err = err
 		return false
 	}
-	// advance nextOff by sizeof(record)
-	// readAtOffset re-read the length, so compute: 4 + 4 + payloadLen
-	// To compute payloadLen, re-serialize? safer: seek and read length again
 	if _, err := it.r.f.Seek(it.nextOff, io.SeekStart); err != nil {
 		it.err = err
 		return false
@@ -313,7 +329,6 @@ func (it *Iterator) Current() *engine.Entry { return it.cur }
 
 func (it *Iterator) Err() error { return it.err }
 
-// ---- Serialization helpers (same format as WAL) ----
 func serializeEntry(e *engine.Entry) []byte {
 	keyLen := uint32(len(e.Key))
 	valLen := uint32(len(e.Value))

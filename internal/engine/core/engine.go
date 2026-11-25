@@ -2,15 +2,19 @@ package core
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kora/internal/engine"
+	"kora/internal/engine/bloom"
 	"kora/internal/engine/compaction"
 	"kora/internal/engine/manifest"
 	"kora/internal/engine/memtable"
@@ -21,15 +25,20 @@ import (
 var ErrNotFound = errors.New("engine: key not found")
 
 type Options struct {
-	DataDir         string
-	WALPath         string
-	ManifestPath    string
-	MemTableMaxSize int64
-	SyncOnWrite     bool
+	DataDir              string
+	WALPath              string
+	ManifestPath         string
+	MemTableMaxSize      int64
+	SyncOnWrite          bool
+	BackgroundCompaction bool
+	CompactionInterval   time.Duration
+	SchedulerConfig      *compaction.Config
 }
 
 type Engine struct {
 	mu              sync.RWMutex
+	flushMu         sync.Mutex
+	compactMu       sync.Mutex
 	wal             *wal.WAL
 	manifest        *manifest.Manifest
 	active          *memtable.MemTable
@@ -39,6 +48,16 @@ type Engine struct {
 	memTableMaxSize int64
 	dataDir         string
 	scheduler       *compaction.Scheduler
+
+	bloomMu    sync.RWMutex
+	bloomCache map[string]*bloom.BloomFilter
+
+	bgEnabled bool
+	flushCh   chan struct{}
+	compactCh chan struct{}
+	stopCh    chan struct{}
+	closed    atomic.Bool
+	bgWg      sync.WaitGroup
 }
 
 func Open(opts Options) (*Engine, error) {
@@ -54,6 +73,9 @@ func Open(opts Options) (*Engine, error) {
 	if opts.ManifestPath == "" {
 		opts.ManifestPath = filepath.Join(opts.DataDir, "manifest.json")
 	}
+
+	// Clean up any orphan temporary WAL from an interrupted rotation before rename.
+	_ = os.Remove(opts.WALPath + ".tmp")
 
 	w, err := wal.Open(opts.WALPath)
 	if err != nil {
@@ -71,6 +93,11 @@ func Open(opts Options) (*Engine, error) {
 		active = memtable.NewMemTableWithSize(opts.MemTableMaxSize)
 	}
 
+	sched := compaction.NewScheduler()
+	if opts.SchedulerConfig != nil {
+		sched = compaction.NewSchedulerWithConfig(*opts.SchedulerConfig)
+	}
+
 	e := &Engine{
 		wal:             w,
 		manifest:        m,
@@ -78,17 +105,42 @@ func Open(opts Options) (*Engine, error) {
 		syncOnWrite:     opts.SyncOnWrite,
 		memTableMaxSize: opts.MemTableMaxSize,
 		dataDir:         opts.DataDir,
-		scheduler:       compaction.NewScheduler(),
+		scheduler:       sched,
+		bloomCache:      make(map[string]*bloom.BloomFilter),
+		bgEnabled:       opts.BackgroundCompaction,
+		flushCh:         make(chan struct{}, 1),
+		compactCh:       make(chan struct{}, 1),
+		stopCh:          make(chan struct{}),
 	}
 
 	if err := e.recoverFromWAL(); err != nil {
 		_ = w.Close()
 		return nil, err
 	}
+
+	if opts.BackgroundCompaction {
+		interval := opts.CompactionInterval
+		if interval <= 0 {
+			interval = 500 * time.Millisecond
+		}
+		e.bgWg.Add(2)
+		go e.backgroundFlushLoop()
+		go e.backgroundCompactLoop(interval)
+		if e.ImmutableCount() > 0 {
+			e.signalFlush()
+		}
+	}
+
 	return e, nil
 }
 
 func (e *Engine) Close() error {
+	if !e.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(e.stopCh)
+	e.bgWg.Wait()
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.wal == nil {
@@ -99,12 +151,70 @@ func (e *Engine) Close() error {
 	return err
 }
 
+func (e *Engine) signalFlush() {
+	if !e.bgEnabled || e.closed.Load() {
+		return
+	}
+	select {
+	case e.flushCh <- struct{}{}:
+	default:
+	}
+}
+
+func (e *Engine) signalCompact() {
+	if !e.bgEnabled || e.closed.Load() {
+		return
+	}
+	select {
+	case e.compactCh <- struct{}{}:
+	default:
+	}
+}
+
+func (e *Engine) backgroundFlushLoop() {
+	defer e.bgWg.Done()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-e.flushCh:
+			if e.closed.Load() {
+				return
+			}
+			if err := e.FlushOnce(); err == nil {
+				e.signalCompact()
+			}
+		}
+	}
+}
+
+func (e *Engine) backgroundCompactLoop(interval time.Duration) {
+	defer e.bgWg.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-e.compactCh:
+			if !e.closed.Load() {
+				_ = e.Compact()
+			}
+		case <-ticker.C:
+			if !e.closed.Load() {
+				_ = e.Compact()
+			}
+		}
+	}
+}
+
 func (e *Engine) Put(key, value []byte, ttl time.Duration) error {
 	if len(key) == 0 {
 		return errors.New("engine: empty key")
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	rotated := false
 
 	e.nextSeq++
 	entry := &engine.Entry{
@@ -118,17 +228,28 @@ func (e *Engine) Put(key, value []byte, ttl time.Duration) error {
 	}
 
 	if _, err := e.wal.Append(entry); err != nil {
+		e.mu.Unlock()
 		return err
 	}
 	if e.syncOnWrite {
 		if err := e.wal.Sync(); err != nil {
+			e.mu.Unlock()
 			return err
 		}
 	}
 	if err := e.active.Put(entry); err != nil {
+		e.mu.Unlock()
 		return err
 	}
-	e.rotateIfFullLocked()
+	if e.active.IsFull() {
+		e.rotateIfFullLocked()
+		rotated = true
+	}
+	e.mu.Unlock()
+
+	if rotated {
+		e.signalFlush()
+	}
 	return nil
 }
 
@@ -137,22 +258,33 @@ func (e *Engine) Delete(key []byte) error {
 		return errors.New("engine: empty key")
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	rotated := false
 
 	e.nextSeq++
 	entry := engine.NewDeleteEntry(cloneBytes(key), e.nextSeq)
 	if _, err := e.wal.Append(entry); err != nil {
+		e.mu.Unlock()
 		return err
 	}
 	if e.syncOnWrite {
 		if err := e.wal.Sync(); err != nil {
+			e.mu.Unlock()
 			return err
 		}
 	}
 	if err := e.active.Put(entry); err != nil {
+		e.mu.Unlock()
 		return err
 	}
-	e.rotateIfFullLocked()
+	if e.active.IsFull() {
+		e.rotateIfFullLocked()
+		rotated = true
+	}
+	e.mu.Unlock()
+
+	if rotated {
+		e.signalFlush()
+	}
 	return nil
 }
 
@@ -161,14 +293,22 @@ func (e *Engine) Get(key []byte) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	e.mu.RLock()
-	defer e.mu.RUnlock()
+	active := e.active
+	immutables := append([]*memtable.MemTable(nil), e.immutables...)
+	e.mu.RUnlock()
 
-	if val, ok := resolveEntry(e.active, key); ok {
-		return val, true, nil
+	if ent, found := active.Get(key); found {
+		if ent.Kind == engine.EntryKindDelete || ent.IsExpired() {
+			return nil, false, nil
+		}
+		return cloneBytes(ent.Value), true, nil
 	}
-	for i := len(e.immutables) - 1; i >= 0; i-- {
-		if val, ok := resolveEntry(e.immutables[i], key); ok {
-			return val, true, nil
+	for i := len(immutables) - 1; i >= 0; i-- {
+		if ent, found := immutables[i].Get(key); found {
+			if ent.Kind == engine.EntryKindDelete || ent.IsExpired() {
+				return nil, false, nil
+			}
+			return cloneBytes(ent.Value), true, nil
 		}
 	}
 
@@ -176,17 +316,32 @@ func (e *Engine) Get(key []byte) ([]byte, bool, error) {
 	if len(candidates) == 0 {
 		return nil, false, nil
 	}
-	// Search newest sequence range first; overlapping L0 files are expected.
+	// Search newest sequence range first (lower level / higher MaxSeq shadows older levels).
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].MaxSeq == candidates[j].MaxSeq {
+			if candidates[i].Level != candidates[j].Level {
+				return candidates[i].Level < candidates[j].Level
+			}
 			return candidates[i].Created > candidates[j].Created
 		}
 		return candidates[i].MaxSeq > candidates[j].MaxSeq
 	})
 	for _, meta := range candidates {
+		e.bloomMu.RLock()
+		bf := e.bloomCache[meta.File]
+		e.bloomMu.RUnlock()
+		if bf != nil && !bf.MightContain(key) {
+			continue
+		}
+
 		r, err := sstable.Open(meta.File)
 		if err != nil {
 			continue
+		}
+		if bf == nil && r.Bloom() != nil {
+			e.bloomMu.Lock()
+			e.bloomCache[meta.File] = r.Bloom()
+			e.bloomMu.Unlock()
 		}
 		ent, err := r.Get(key)
 		_ = r.Close()
@@ -255,33 +410,52 @@ func (e *Engine) rotateIfFullLocked() {
 	e.active = memtable.NewMemTable()
 }
 
-// FlushOnce flushes all currently frozen memtables (immutables) to SSTables,
-// updates the manifest, and replaces the WAL with a compacted WAL containing only active entries.
-// This is a synchronous operation intended for tests and simple flush pipeline.
-func (e *Engine) FlushOnce() error {
-	e.mu.Lock()
-	imm := e.immutables
-	e.immutables = nil
-	e.mu.Unlock()
+func uniqueFlushSuffix() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
 
-	// For each immutable memtable, write an SSTable file.
-	for idx, mt := range imm {
-		// Build filename
-		fname := filepath.Join(e.dataDir, fmt.Sprintf("sstable-%s-%d.sst", time.Now().Format("20060102T150405"), idx))
+// FlushOnce flushes all currently frozen memtables (immutables) to SSTables,
+// updates the manifest atomically before dropping immutables from memory (avoiding read gaps),
+// and atomically rotates the WAL under lock so concurrent writes cannot be lost.
+func (e *Engine) FlushOnce() error {
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
+
+	e.mu.RLock()
+	if len(e.immutables) == 0 {
+		e.mu.RUnlock()
+		return nil
+	}
+	immSnapshot := append([]*memtable.MemTable(nil), e.immutables...)
+	e.mu.RUnlock()
+
+	flushedSet := make(map[*memtable.MemTable]struct{}, len(immSnapshot))
+
+	for idx, mt := range immSnapshot {
+		fname := filepath.Join(
+			e.dataDir,
+			fmt.Sprintf("sstable-%s-%d-%s.sst", time.Now().Format("20060102T150405"), idx, uniqueFlushSuffix()),
+		)
 		w, err := sstable.NewWriter(fname)
 		if err != nil {
 			return err
 		}
 		iter := mt.Iterator()
-		defer iter.Close()
 		var minKey, maxKey []byte
 		var minSeq, maxSeq uint64
 		first := true
+		bf := bloom.New(uint64(mt.Size()+1), 0.01)
+
 		for iter.Next() {
 			ent := iter.Current()
 			if ent == nil {
 				continue
 			}
+			bf.Add(ent.Key)
 			if first {
 				minKey = cloneBytes(ent.Key)
 				maxKey = cloneBytes(ent.Key)
@@ -303,14 +477,16 @@ func (e *Engine) FlushOnce() error {
 				}
 			}
 			if err := w.Add(ent); err != nil {
-				w.Close()
+				_ = iter.Close()
+				_ = w.Close()
 				return err
 			}
 		}
+		_ = iter.Close()
 		if err := w.Close(); err != nil {
 			return err
 		}
-		// stat file size
+
 		fi, err := os.Stat(fname)
 		if err != nil {
 			return err
@@ -325,96 +501,143 @@ func (e *Engine) FlushOnce() error {
 			MaxSeq:  maxSeq,
 			Created: time.Now().UnixNano(),
 		}
+		e.bloomMu.Lock()
+		e.bloomCache[fname] = bf
+		e.bloomMu.Unlock()
+
 		if err := e.manifest.Add(meta); err != nil {
 			return err
 		}
+		flushedSet[mt] = struct{}{}
 	}
 
-	// Replace WAL with compacted WAL that contains only active entries
-	// Create temporary WAL
+	// Atomically prune flushed immutables and rotate WAL while holding e.mu.Lock
+	// so no concurrent Put/Delete can race with WAL close/rename or be lost.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	remaining := make([]*memtable.MemTable, 0, len(e.immutables))
+	for _, mt := range e.immutables {
+		if _, done := flushedSet[mt]; !done {
+			remaining = append(remaining, mt)
+		}
+	}
+	e.immutables = remaining
+
+	if e.wal == nil {
+		return nil
+	}
+
 	oldPath := e.wal.Path()
 	tmpPath := oldPath + ".tmp"
 	newWal, err := wal.Open(tmpPath)
 	if err != nil {
 		return err
 	}
-	// iterate active entries
-	e.mu.RLock()
-	actIter := e.active.Iterator()
-	e.mu.RUnlock()
-	defer actIter.Close()
-	for actIter.Next() {
-		ent := actIter.Current()
-		if ent == nil {
-			continue
+
+	writeUnflushed := func(mt *memtable.MemTable) error {
+		it := mt.Iterator()
+		defer it.Close()
+		for it.Next() {
+			ent := it.Current()
+			if ent == nil {
+				continue
+			}
+			if _, err := newWal.Append(ent); err != nil {
+				return err
+			}
 		}
-		if _, err := newWal.Append(ent); err != nil {
-			newWal.Close()
+		return nil
+	}
+
+	for _, mt := range e.immutables {
+		if err := writeUnflushed(mt); err != nil {
+			_ = newWal.Close()
+			_ = os.Remove(tmpPath)
 			return err
 		}
 	}
+	if err := writeUnflushed(e.active); err != nil {
+		_ = newWal.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
 	if err := newWal.Sync(); err != nil {
-		newWal.Close()
+		_ = newWal.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
 	if err := newWal.Close(); err != nil {
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	// Close old WAL, atomically replace
 	if err := e.wal.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, oldPath); err != nil {
 		return err
 	}
-	// Re-open WAL
 	w2, err := wal.Open(oldPath)
 	if err != nil {
 		return err
 	}
-	e.mu.Lock()
 	e.wal = w2
-	e.mu.Unlock()
 	return nil
 }
 
-// Compact attempts to compact Level 0 files if a compaction job is needed.
-// It executes the compaction job and updates the manifest accordingly.
+// Compact runs multi-level compaction (cascading L0 -> L1 -> L2... as needed),
+// atomically updating the manifest via Replace so concurrent FlushOnce and Get
+// operations never observe missing keys or conflicting manifest updates.
 func (e *Engine) Compact() error {
-	e.mu.RLock()
-	files := e.manifest.List()
-	sched := e.scheduler
-	dataDir := e.dataDir
-	e.mu.RUnlock()
+	e.compactMu.Lock()
+	defer e.compactMu.Unlock()
 
-	// Select a compaction job
-	job := sched.SelectCompactionJob(files, dataDir)
-	if job == nil {
-		return nil // no compaction needed
-	}
+	// Bound cascading steps per Compact() invocation to prevent unbounded loops.
+	for step := 0; step < 8; step++ {
+		files := e.manifest.List()
+		job := e.scheduler.SelectCompactionJob(files, e.dataDir)
+		if job == nil {
+			return nil
+		}
 
-	// Execute the compaction job
-	outMeta, err := compaction.ExecuteCompactionJob(job)
-	if err != nil {
-		return err
-	}
-
-	// Update manifest: add new file and remove old files
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Add the new compacted file
-	if err := e.manifest.Add(outMeta); err != nil {
-		return err
-	}
-
-	// Remove the input files from manifest
-	for _, inMeta := range job.InputFiles {
-		if err := e.manifest.Remove(inMeta.File); err != nil {
+		outMeta, wroteOutput, err := compaction.ExecuteCompactionJobFull(job)
+		if err != nil {
 			return err
 		}
-	}
 
+		removed := make([]string, 0, len(job.InputFiles))
+		for _, inMeta := range job.InputFiles {
+			removed = append(removed, inMeta.File)
+		}
+
+		var added []manifest.SSTableMeta
+		if wroteOutput {
+			added = []manifest.SSTableMeta{outMeta}
+			if r, err := sstable.Open(outMeta.File); err == nil {
+				if r.Bloom() != nil {
+					e.bloomMu.Lock()
+					e.bloomCache[outMeta.File] = r.Bloom()
+					e.bloomMu.Unlock()
+				}
+				_ = r.Close()
+			}
+		}
+
+		if err := e.manifest.Replace(added, removed); err != nil {
+			return err
+		}
+
+		e.bloomMu.Lock()
+		for _, fn := range removed {
+			delete(e.bloomCache, fn)
+		}
+		e.bloomMu.Unlock()
+
+		for _, fn := range removed {
+			_ = os.Remove(fn)
+		}
+	}
 	return nil
 }
 

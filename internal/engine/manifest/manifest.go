@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"kora/internal/util"
@@ -13,20 +14,19 @@ import (
 
 // SSTableMeta describes an SSTable file tracked in the manifest.
 type SSTableMeta struct {
-	File     string `json:"file"`
-	Level    int    `json:"level"`
-	MinKey   []byte `json:"min_key"`
-	MaxKey   []byte `json:"max_key"`
-	Size     int64  `json:"size"`
-	MinSeq   uint64 `json:"min_seq"`
-	MaxSeq   uint64 `json:"max_seq"`
-	Created  int64  `json:"created"` // unix nanos
+	File    string `json:"file"`
+	Level   int    `json:"level"`
+	MinKey  []byte `json:"min_key"`
+	MaxKey  []byte `json:"max_key"`
+	Size    int64  `json:"size"`
+	MinSeq  uint64 `json:"min_seq"`
+	MaxSeq  uint64 `json:"max_seq"`
+	Created int64  `json:"created"` // unix nanos
 }
 
 // Manifest manages metadata for SSTables.
 // File format: [4 bytes payloadLen][4 bytes crc32][payload JSON]
-// payload is JSON array of SSTableMeta
-
+// Saved crash-safely via write-to-temp + fsync + atomic POSIX rename.
 type Manifest struct {
 	mu     sync.Mutex
 	path   string
@@ -40,9 +40,13 @@ func New(path string) *Manifest {
 }
 
 // Load reads manifest file and populates items. Returns error if file corrupt or unreadable.
+// Also cleans up any leftover .tmp file from an interrupted save before rename.
 func (m *Manifest) Load() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	_ = os.Remove(m.path + ".tmp")
+
 	f, err := os.Open(m.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -79,7 +83,7 @@ func (m *Manifest) Load() error {
 	return nil
 }
 
-// Save writes current manifest items to disk atomically (write then fsync).
+// Save writes current manifest items to disk atomically (write .tmp, fsync, atomic rename).
 func (m *Manifest) Save() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -87,46 +91,75 @@ func (m *Manifest) Save() error {
 }
 
 func (m *Manifest) saveLocked() error {
+	if err := os.MkdirAll(filepath.Dir(m.path), 0755); err != nil {
+		return err
+	}
+
 	b, err := json.Marshal(m.items)
 	if err != nil {
 		return err
 	}
 	crc := util.CRC32(b)
-	f, err := os.OpenFile(m.path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+
+	tmpPath := m.path + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	var lenBuf [4]byte
-	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(b)))
-	if _, err := f.Write(lenBuf[:]); err != nil {
+
+	writeErr := func() error {
+		var lenBuf [4]byte
+		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(b)))
+		if _, err := f.Write(lenBuf[:]); err != nil {
+			return err
+		}
+		var crcBuf [4]byte
+		binary.LittleEndian.PutUint32(crcBuf[:], crc)
+		if _, err := f.Write(crcBuf[:]); err != nil {
+			return err
+		}
+		if _, err := f.Write(b); err != nil {
+			return err
+		}
+		return f.Sync()
+	}()
+
+	closeErr := f.Close()
+	if writeErr != nil {
+		_ = os.Remove(tmpPath)
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return closeErr
+	}
+
+	if err := os.Rename(tmpPath, m.path); err != nil {
 		return err
 	}
-	var crcBuf [4]byte
-	binary.LittleEndian.PutUint32(crcBuf[:], crc)
-	if _, err := f.Write(crcBuf[:]); err != nil {
-		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		return err
+
+	// Best-effort fsync on parent directory so the rename entry is durable.
+	if dirFile, err := os.Open(filepath.Dir(m.path)); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
 	}
 	return nil
 }
 
-// Add appends a new SSTableMeta and saves manifest to disk.
+// Add appends a new SSTableMeta and saves manifest to disk atomically under one lock.
 func (m *Manifest) Add(meta SSTableMeta) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.items = append(m.items, meta)
-	m.mu.Unlock()
-	return m.Save()
+	return m.saveLocked()
 }
 
-// Remove removes an SSTable file entry by filename and saves manifest.
+// Remove removes an SSTable file entry by filename and saves manifest atomically.
 func (m *Manifest) Remove(filename string) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	idx := -1
 	for i := range m.items {
 		if m.items[i].File == filename {
@@ -135,13 +168,32 @@ func (m *Manifest) Remove(filename string) error {
 		}
 	}
 	if idx == -1 {
-		m.mu.Unlock()
 		return nil
 	}
 	m.items = append(m.items[:idx], m.items[idx+1:]...)
-	err := m.saveLocked()
-	m.mu.Unlock()
-	return err
+	return m.saveLocked()
+}
+
+// Replace atomically removes all filenames in removedFiles and adds all metas in added
+// within a single manifest lock and single atomic file swap. Used by compaction.
+func (m *Manifest) Replace(added []SSTableMeta, removedFiles []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	removeSet := make(map[string]struct{}, len(removedFiles))
+	for _, fn := range removedFiles {
+		removeSet[fn] = struct{}{}
+	}
+
+	next := make([]SSTableMeta, 0, len(m.items)+len(added))
+	for _, item := range m.items {
+		if _, drop := removeSet[item.File]; !drop {
+			next = append(next, item)
+		}
+	}
+	next = append(next, added...)
+	m.items = next
+	return m.saveLocked()
 }
 
 // List returns a copy of current manifest items.

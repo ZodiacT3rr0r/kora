@@ -2,6 +2,7 @@ package memtable
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"kora/internal/engine"
 	"kora/internal/util"
@@ -13,14 +14,16 @@ const (
 	defaultMemTableSizeBytes = 64 * 1024 * 1024
 )
 
-// MemTable is an in-memory write buffer that wraps a SkipList.
-// It tracks approximate memory usage and manages freeze semantics for durability.
+// MemTable is an in-memory write buffer backed by a fine-grained concurrent SkipList.
+// Reads (Get, Size, IsFull, IsFrozen, Iterator) are completely lock-free;
+// concurrent writers run in parallel under freezeMu.RLock while Freeze() acquires
+// freezeMu.Lock to wait for in-flight writes before sealing the MemTable.
 type MemTable struct {
-	mu           sync.RWMutex
+	freezeMu     sync.RWMutex
 	skipList     *SkipList
-	sizeBytes    int64
+	sizeBytes    atomic.Int64
 	maxSizeBytes int64
-	frozen       bool
+	frozen       atomic.Bool
 }
 
 // NewMemTable creates a MemTable with default size threshold.
@@ -39,89 +42,62 @@ func NewMemTableWithSize(maxSizeBytes int64) *MemTable {
 	}
 }
 
-// Put inserts or replaces an entry in the MemTable.
-// Returns error if the MemTable is frozen (read-only).
-// Updates the approximate size counter.
+// Put inserts or replaces an entry in the MemTable concurrently.
+// Multiple writers can execute Put in parallel; freezeMu.RLock only coordinates with Freeze().
 func (m *MemTable) Put(entry *engine.Entry) error {
 	if entry == nil {
 		return nil
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.freezeMu.RLock()
+	defer m.freezeMu.RUnlock()
 
-	if m.frozen {
+	if m.frozen.Load() {
 		return ErrMemTableFrozen
 	}
 
-	// Estimate the byte cost of the entry.
-	cost := int64(len(entry.Key) + len(entry.Value) + 40) // 40 bytes for overhead (SeqNum, Kind, ExpiresAt, pointers)
-
-	// Store the entry.
+	cost := int64(len(entry.Key) + len(entry.Value) + 40)
 	m.skipList.Put(entry)
-
-	// Update size. In a real system this would be more sophisticated (tracking deltas).
-	// For now we approximate by adding the cost.
-	m.sizeBytes += cost
+	m.sizeBytes.Add(cost)
 
 	return nil
 }
 
-// Get retrieves an entry from the MemTable.
+// Get retrieves an entry from the MemTable without acquiring any locks.
 func (m *MemTable) Get(key []byte) (*engine.Entry, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	return m.skipList.Get(key)
 }
 
 // Size returns the number of unique keys in the MemTable.
 func (m *MemTable) Size() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	return m.skipList.Size()
 }
 
 // ApproximateSizeBytes returns the estimated byte usage of the MemTable.
 func (m *MemTable) ApproximateSizeBytes() int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.sizeBytes
+	return m.sizeBytes.Load()
 }
 
 // IsFull returns true if the MemTable has reached or exceeded the size threshold.
 func (m *MemTable) IsFull() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.sizeBytes >= m.maxSizeBytes
+	return m.sizeBytes.Load() >= m.maxSizeBytes
 }
 
 // IsFrozen returns true if the MemTable is read-only (marked for flush).
 func (m *MemTable) IsFrozen() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.frozen
+	return m.frozen.Load()
 }
 
-// Freeze marks the MemTable as read-only.
-// After freeze, Put operations will fail.
-// The MemTable can still be read and iterated for flushing to disk.
+// Freeze marks the MemTable as read-only after waiting for any in-flight Put calls.
 func (m *MemTable) Freeze() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.freezeMu.Lock()
+	defer m.freezeMu.Unlock()
 
-	m.frozen = true
+	m.frozen.Store(true)
 }
 
-// Iterator returns an ordered iterator over the MemTable.
+// Iterator returns an ordered lock-free iterator over the MemTable.
 func (m *MemTable) Iterator() util.Iterator {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	return m.skipList.Iterator()
 }
 

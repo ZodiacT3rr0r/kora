@@ -166,3 +166,74 @@ func TestEmptySkipListIterator(t *testing.T) {
 		t.Fatal("expected current to be nil for empty iterator")
 	}
 }
+
+func TestSkipListConcurrentReadsAndWrites(t *testing.T) {
+	sl := NewSkipList()
+	const writers = 8
+	const keysPerWriter = 150
+
+	done := make(chan struct{})
+	// Concurrent readers running lock-free while writers insert and overwrite
+	for r := 0; r < 4; r++ {
+		go func(id int) {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					_, _ = sl.Get([]byte(fmt.Sprintf("w-%d-k-%03d", id%writers, 42)))
+					it := sl.Iterator()
+					if it.Seek([]byte("w-2")) {
+						_ = it.Current()
+					}
+					_ = it.Close()
+				}
+			}
+		}(r)
+	}
+
+	errCh := make(chan error, writers)
+	for w := 0; w < writers; w++ {
+		go func(wID int) {
+			for k := 0; k < keysPerWriter; k++ {
+				key := []byte(fmt.Sprintf("w-%d-k-%03d", wID, k))
+				sl.Put(&engine.Entry{
+					Key:    key,
+					Value:  []byte("v1"),
+					Kind:   engine.EntryKindSet,
+					SeqNum: uint64(k + 1),
+				})
+				// Overwrite same key concurrently
+				sl.Put(&engine.Entry{
+					Key:    key,
+					Value:  []byte("v2"),
+					Kind:   engine.EntryKindSet,
+					SeqNum: uint64(k + 1000),
+				})
+			}
+			errCh <- nil
+		}(w)
+	}
+
+	for w := 0; w < writers; w++ {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(done)
+
+	if got, want := sl.Size(), writers*keysPerWriter; got != want {
+		t.Fatalf("concurrent size mismatch: got %d want %d", got, want)
+	}
+	for w := 0; w < writers; w++ {
+		for k := 0; k < keysPerWriter; k++ {
+			key := []byte(fmt.Sprintf("w-%d-k-%03d", wIDHelper(w), k))
+			ent, ok := sl.Get(key)
+			if !ok || string(ent.Value) != "v2" {
+				t.Fatalf("missing or stale key %s: ok=%v ent=%+v", key, ok, ent)
+			}
+		}
+	}
+}
+
+func wIDHelper(w int) int { return w }

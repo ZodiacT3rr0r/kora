@@ -168,3 +168,114 @@ func TestExecuteCompactionJobMergesFiles(t *testing.T) {
 		t.Error("merged sst key c should have seqnum 4 (LWW)")
 	}
 }
+
+func TestRandomIDGeneratesUniqueIdentifiers(t *testing.T) {
+	seen := make(map[string]struct{}, 64)
+	for i := 0; i < 64; i++ {
+		id := randomID()
+		if _, dup := seen[id]; dup {
+			t.Fatalf("duplicate randomID generated on iteration %d: %s", i, id)
+		}
+		seen[id] = struct{}{}
+	}
+}
+
+func TestTombstoneDroppedAtBottomLevelAndPreservedAboveLowerLevel(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	p1 := filepath.Join(tmpDir, "l0_1.sst")
+	w1, _ := sstable.NewWriter(p1)
+	_ = w1.Add(&engine.Entry{Key: []byte("drop_me"), Value: []byte("old"), Kind: engine.EntryKindSet, SeqNum: 1})
+	_ = w1.Add(&engine.Entry{Key: []byte("keep_tomb"), Value: []byte("v"), Kind: engine.EntryKindSet, SeqNum: 2})
+	_ = w1.Add(&engine.Entry{Key: []byte("live"), Value: []byte("ok"), Kind: engine.EntryKindSet, SeqNum: 3})
+	_ = w1.Close()
+
+	p2 := filepath.Join(tmpDir, "l0_2.sst")
+	w2, _ := sstable.NewWriter(p2)
+	_ = w2.Add(engine.NewDeleteEntry([]byte("drop_me"), 4))
+	_ = w2.Add(engine.NewDeleteEntry([]byte("keep_tomb"), 5))
+	_ = w2.Close()
+
+	fi1, _ := os.Stat(p1)
+	fi2, _ := os.Stat(p2)
+
+	// Simulate an L2 SSTable whose range ["keep_a", "keep_z"] overlaps "keep_tomb" but NOT "drop_me".
+	job := &CompactionJob{
+		InputFiles: []manifest.SSTableMeta{
+			{File: p1, Level: 0, MinKey: []byte("drop_me"), MaxKey: []byte("live"), Size: fi1.Size(), MinSeq: 1, MaxSeq: 3},
+			{File: p2, Level: 0, MinKey: []byte("drop_me"), MaxKey: []byte("keep_tomb"), Size: fi2.Size(), MinSeq: 4, MaxSeq: 5},
+		},
+		OutputPath:  filepath.Join(tmpDir, "out_l1.sst"),
+		TargetLevel: 1,
+		LowerLevelFiles: []manifest.SSTableMeta{
+			{File: "l2.sst", Level: 2, MinKey: []byte("keep_a"), MaxKey: []byte("keep_z"), Size: 100},
+		},
+		CheckBottomTombstone: true,
+	}
+
+	outMeta, wrote, err := ExecuteCompactionJobFull(job)
+	if err != nil || !wrote {
+		t.Fatalf("ExecuteCompactionJobFull failed: wrote=%v err=%v", wrote, err)
+	}
+
+	r, err := sstable.Open(outMeta.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	// "drop_me" has no overlapping lower level -> tombstone must be purged.
+	if _, err := r.Get([]byte("drop_me")); err == nil {
+		t.Fatal("expected tombstone for drop_me to be dropped when no lower level overlaps")
+	}
+	// "keep_tomb" overlaps L2 ["keep_a", "keep_z"] -> tombstone must be preserved to prevent ghost reads.
+	entKeep, err := r.Get([]byte("keep_tomb"))
+	if err != nil || entKeep.Kind != engine.EntryKindDelete {
+		t.Fatalf("expected tombstone for keep_tomb to be preserved, got ent=%+v err=%v", entKeep, err)
+	}
+	// "live" must remain intact.
+	entLive, err := r.Get([]byte("live"))
+	if err != nil || string(entLive.Value) != "ok" {
+		t.Fatalf("expected live=ok, got ent=%+v err=%v", entLive, err)
+	}
+}
+
+func TestLeveledCompactionCascadesL1ToL2(t *testing.T) {
+	tmpDir := t.TempDir()
+	sched := NewSchedulerWithConfig(Config{
+		Level0FileThreshold: 4,
+		Level0SizeThreshold: 10 * 1024 * 1024,
+		BaseLevelSize:       50, // tiny L1 budget so L1 -> L2 triggers
+		LevelMultiplier:     10,
+		MaxLevels:           4,
+	})
+
+	l1Path := filepath.Join(tmpDir, "l1.sst")
+	w1, _ := sstable.NewWriter(l1Path)
+	_ = w1.Add(&engine.Entry{Key: []byte("b"), Value: []byte("newer"), Kind: engine.EntryKindSet, SeqNum: 5})
+	_ = w1.Close()
+	fi1, _ := os.Stat(l1Path)
+
+	l2Path := filepath.Join(tmpDir, "l2.sst")
+	w2, _ := sstable.NewWriter(l2Path)
+	_ = w2.Add(&engine.Entry{Key: []byte("a"), Value: []byte("va"), Kind: engine.EntryKindSet, SeqNum: 1})
+	_ = w2.Add(&engine.Entry{Key: []byte("b"), Value: []byte("older"), Kind: engine.EntryKindSet, SeqNum: 2})
+	_ = w2.Close()
+	fi2, _ := os.Stat(l2Path)
+
+	metas := []manifest.SSTableMeta{
+		{File: l1Path, Level: 1, MinKey: []byte("b"), MaxKey: []byte("b"), Size: fi1.Size(), MinSeq: 5, MaxSeq: 5, Created: 2},
+		{File: l2Path, Level: 2, MinKey: []byte("a"), MaxKey: []byte("b"), Size: fi2.Size(), MinSeq: 1, MaxSeq: 2, Created: 1},
+	}
+
+	job := sched.SelectCompactionJob(metas, tmpDir)
+	if job == nil {
+		t.Fatal("expected L1 -> L2 compaction job when L1 exceeds BaseLevelSize")
+	}
+	if job.TargetLevel != 2 {
+		t.Fatalf("expected TargetLevel 2, got %d", job.TargetLevel)
+	}
+	if len(job.InputFiles) != 2 {
+		t.Fatalf("expected L1 victim + overlapping L2 file (2 inputs), got %d", len(job.InputFiles))
+	}
+}

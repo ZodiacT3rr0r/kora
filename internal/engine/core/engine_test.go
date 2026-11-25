@@ -128,3 +128,48 @@ func TestEngineCustomPaths(t *testing.T) {
 		t.Fatalf("expected WAL file at custom path: %v", err)
 	}
 }
+
+func TestEngineBackgroundFlushAndCompaction(t *testing.T) {
+	dir := t.TempDir()
+	e, err := Open(Options{
+		DataDir:              dir,
+		MemTableMaxSize:      1024,
+		BackgroundCompaction: true,
+		CompactionInterval:   25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+
+	for i := 0; i < 120; i++ {
+		k := []byte("bg-key-" + string(rune('A'+(i%26))) + string(rune('0'+(i%10))))
+		if err := e.Put(k, []byte("payload-for-background-flush-and-compaction"), 0); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	// Delete one key and ensure tombstone semantics hold across background flush/compaction.
+	targetDel := []byte("bg-key-A0")
+	if err := e.Delete(targetDel); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if e.ImmutableCount() == 0 && len(e.manifest.List()) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if _, ok, err := e.Get(targetDel); err != nil || ok {
+		t.Fatalf("expected deleted key to stay deleted after background compaction: ok=%v err=%v", ok, err)
+	}
+	val, ok, err := e.Get([]byte("bg-key-B1"))
+	if err != nil || !ok || string(val) != "payload-for-background-flush-and-compaction" {
+		t.Fatalf("unexpected value after background flush/compaction: ok=%v val=%q err=%v", ok, val, err)
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
