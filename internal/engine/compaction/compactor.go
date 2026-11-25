@@ -47,10 +47,18 @@ func MergeFilesWithFilter(
 		cur *engine.Entry
 	}
 	srcs := make([]*src, 0, len(metas))
+	closeAll := func() {
+		for _, s := range srcs {
+			if s.r != nil {
+				_ = s.r.Close()
+			}
+		}
+	}
 	for _, m := range metas {
-		r, err := sstable.Open(m.File)
+		r, err := sstable.OpenWithoutBloom(m.File)
 		if err != nil {
-			continue
+			closeAll()
+			return meta, false, err
 		}
 		it := r.Iterator()
 		s := &src{r: r, it: it}
@@ -58,14 +66,6 @@ func MergeFilesWithFilter(
 			s.cur = it.Current()
 		}
 		srcs = append(srcs, s)
-	}
-
-	closeAll := func() {
-		for _, s := range srcs {
-			if s.r != nil {
-				_ = s.r.Close()
-			}
-		}
 	}
 
 	h := &minHeap{}

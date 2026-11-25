@@ -98,10 +98,18 @@ func Open(opts Options) (*Engine, error) {
 		sched = compaction.NewSchedulerWithConfig(*opts.SchedulerConfig)
 	}
 
+	var maxManifestSeq uint64
+	for _, meta := range m.List() {
+		if meta.MaxSeq > maxManifestSeq {
+			maxManifestSeq = meta.MaxSeq
+		}
+	}
+
 	e := &Engine{
 		wal:             w,
 		manifest:        m,
 		active:          active,
+		nextSeq:         maxManifestSeq,
 		syncOnWrite:     opts.SyncOnWrite,
 		memTableMaxSize: opts.MemTableMaxSize,
 		dataDir:         opts.DataDir,
@@ -316,15 +324,16 @@ func (e *Engine) Get(key []byte) ([]byte, bool, error) {
 	if len(candidates) == 0 {
 		return nil, false, nil
 	}
-	// Search newest sequence range first (lower level / higher MaxSeq shadows older levels).
+	// Search shallower levels first (L0 newest-to-oldest, then L1, L2...),
+	// matching standard LSM leveled semantics so deeper files never shadow newer levels.
 	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].MaxSeq == candidates[j].MaxSeq {
-			if candidates[i].Level != candidates[j].Level {
-				return candidates[i].Level < candidates[j].Level
-			}
-			return candidates[i].Created > candidates[j].Created
+		if candidates[i].Level != candidates[j].Level {
+			return candidates[i].Level < candidates[j].Level
 		}
-		return candidates[i].MaxSeq > candidates[j].MaxSeq
+		if candidates[i].MaxSeq != candidates[j].MaxSeq {
+			return candidates[i].MaxSeq > candidates[j].MaxSeq
+		}
+		return candidates[i].Created > candidates[j].Created
 	})
 	for _, meta := range candidates {
 		e.bloomMu.RLock()
@@ -334,7 +343,15 @@ func (e *Engine) Get(key []byte) ([]byte, bool, error) {
 			continue
 		}
 
-		r, err := sstable.Open(meta.File)
+		var (
+			r   *sstable.Reader
+			err error
+		)
+		if bf != nil {
+			r, err = sstable.OpenWithoutBloom(meta.File)
+		} else {
+			r, err = sstable.Open(meta.File)
+		}
 		if err != nil {
 			continue
 		}
@@ -577,6 +594,10 @@ func (e *Engine) FlushOnce() error {
 	}
 	if err := os.Rename(tmpPath, oldPath); err != nil {
 		return err
+	}
+	if dirFile, err := os.Open(filepath.Dir(oldPath)); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
 	}
 	w2, err := wal.Open(oldPath)
 	if err != nil {

@@ -173,3 +173,54 @@ func TestEngineBackgroundFlushAndCompaction(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 }
+
+func TestEngineSeqNumMonotonicAcrossFlushedRestart(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		DataDir:         dir,
+		MemTableMaxSize: 1024,
+	}
+	e, err := Open(opts)
+	if err != nil {
+		t.Fatalf("open 1: %v", err)
+	}
+	for i := 0; i < 40; i++ {
+		k := []byte("seq-key-" + string(rune('a'+(i%26))))
+		if err := e.Put(k, []byte("old-value-payload-padding-to-trigger-flush"), 0); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if err := e.FlushOnce(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("close 1: %v", err)
+	}
+
+	// Reopen with flushed SSTables and overwrite key "seq-key-a" with a fresh value.
+	e2, err := Open(opts)
+	if err != nil {
+		t.Fatalf("open 2: %v", err)
+	}
+	defer e2.Close()
+	if e2.nextSeq == 0 {
+		t.Fatalf("expected nextSeq initialized from manifest MaxSeq, got 0")
+	}
+	if err := e2.Put([]byte("seq-key-a"), []byte("new-value"), 0); err != nil {
+		t.Fatalf("put overwrite: %v", err)
+	}
+	// Force flush and compact so both versions meet in SSTables.
+	for i := 0; i < 35; i++ {
+		_ = e2.Put([]byte("pad-"+string(rune('0'+(i%10)))), []byte("padding-value-for-second-flush-trigger"), 0)
+	}
+	if err := e2.FlushOnce(); err != nil {
+		t.Fatalf("flush 2: %v", err)
+	}
+	if err := e2.Compact(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	got, ok, err := e2.Get([]byte("seq-key-a"))
+	if err != nil || !ok || string(got) != "new-value" {
+		t.Fatalf("expected 'new-value' after flushed restart + compaction, got ok=%v val=%q err=%v", ok, got, err)
+	}
+}

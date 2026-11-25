@@ -3,6 +3,8 @@ package server
 import (
 	"fmt"
 	"net"
+	"strings"
+	"sync"
 	"time"
 
 	"kora/internal/engine/core"
@@ -12,6 +14,7 @@ import (
 type Server struct {
 	addr   string
 	engine *core.Engine
+	mu     sync.Mutex
 	ln     net.Listener
 }
 
@@ -29,8 +32,17 @@ func (s *Server) Listen() error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.ln = ln
-	defer ln.Close()
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.ln == ln {
+			s.ln = nil
+		}
+		s.mu.Unlock()
+		_ = ln.Close()
+	}()
 
 	for {
 		conn, err := ln.Accept()
@@ -43,8 +55,11 @@ func (s *Server) Listen() error {
 
 // Stop stops the server.
 func (s *Server) Stop() error {
-	if s.ln != nil {
-		return s.ln.Close()
+	s.mu.Lock()
+	ln := s.ln
+	s.mu.Unlock()
+	if ln != nil {
+		return ln.Close()
 	}
 	return nil
 }
@@ -102,9 +117,9 @@ func (s *Server) cmdSet(w *RespWriter, args []string) {
 	key := args[0]
 	value := args[1]
 	var ttl time.Duration
-	if len(args) >= 4 && args[2] == "EX" {
+	if len(args) >= 4 && strings.ToUpper(args[2]) == "EX" {
 		ex, err := time.ParseDuration(args[3] + "s")
-		if err != nil {
+		if err != nil || ex <= 0 {
 			w.WriteError("ERR invalid expire time")
 			return
 		}

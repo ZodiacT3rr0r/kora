@@ -91,3 +91,14 @@ func TestMergeFilesBasic(t *testing.T) {
         t.Fatalf("expected c=v3 got %s", string(ec.Value))
     }
 }
+
+func TestMergeFilesErrorsOnMissingInput(t *testing.T) {
+    dir := t.TempDir()
+    missing := manifest.SSTableMeta{
+        File:  filepath.Join(dir, "does-not-exist.sst"),
+        Level: 0,
+    }
+    if _, err := MergeFiles([]manifest.SSTableMeta{missing}, filepath.Join(dir, "out.sst")); err == nil {
+        t.Fatalf("expected error when input SSTable is missing, got nil")
+    }
+}

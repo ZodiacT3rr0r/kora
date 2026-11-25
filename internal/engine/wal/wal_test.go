@@ -120,4 +120,19 @@ func TestWALTruncatePartialRecord(t *testing.T) {
 	if len(recovered) != 2 {
 		t.Fatalf("expected 2 recovered entries, got %d", len(recovered))
 	}
+
+	// Verify torn tail was truncated cleanly so a subsequent append recovers properly.
+	if _, err := w2.Append(&engine.Entry{Key: []byte("w"), Value: []byte("4"), Kind: engine.EntryKindSet, SeqNum: 4}); err != nil {
+		t.Fatalf("append after recovery: %v", err)
+	}
+	if err := w2.Sync(); err != nil {
+		t.Fatalf("sync after recovery: %v", err)
+	}
+	recovered2, err := w2.Recover()
+	if err != nil {
+		t.Fatalf("second recover: %v", err)
+	}
+	if len(recovered2) != 3 || string(recovered2[2].Key) != "w" {
+		t.Fatalf("expected 3 entries ending in 'w', got %d", len(recovered2))
+	}
 }

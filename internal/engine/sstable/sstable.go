@@ -135,7 +135,18 @@ type Reader struct {
 	dataEnd   int64
 }
 
+// Open opens an existing SSTable and builds its in-memory Bloom filter.
 func Open(path string) (*Reader, error) {
+	return openSSTable(path, true)
+}
+
+// OpenWithoutBloom opens an existing SSTable without rebuilding a Bloom filter.
+// Used on Engine.Get when Engine.bloomCache already matched and on sequential compaction merges.
+func OpenWithoutBloom(path string) (*Reader, error) {
+	return openSSTable(path, false)
+}
+
+func openSSTable(path string, buildBloom bool) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -202,9 +213,12 @@ func Open(path string) (*Reader, error) {
 		offs = append(offs, offset)
 	}
 
-	bf := bloom.New(uint64(len(keys)), 0.01)
-	for _, k := range keys {
-		bf.Add(k)
+	var bf *bloom.BloomFilter
+	if buildBloom {
+		bf = bloom.New(uint64(len(keys)), 0.01)
+		for _, k := range keys {
+			bf.Add(k)
+		}
 	}
 
 	return &Reader{
@@ -259,21 +273,14 @@ func (r *Reader) Seek(target []byte) (*engine.Entry, error) {
 }
 
 func (r *Reader) readAtOffset(off int64) (*engine.Entry, error) {
-	if _, err := r.f.Seek(off, io.SeekStart); err != nil {
+	var hdr [8]byte
+	if _, err := r.f.ReadAt(hdr[:], off); err != nil {
 		return nil, err
 	}
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(r.f, lenBuf[:]); err != nil {
-		return nil, err
-	}
-	payloadLen := binary.LittleEndian.Uint32(lenBuf[:])
-	var crcBuf [4]byte
-	if _, err := io.ReadFull(r.f, crcBuf[:]); err != nil {
-		return nil, err
-	}
-	crc := binary.LittleEndian.Uint32(crcBuf[:])
+	payloadLen := binary.LittleEndian.Uint32(hdr[0:4])
+	crc := binary.LittleEndian.Uint32(hdr[4:8])
 	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(r.f, payload); err != nil {
+	if _, err := r.f.ReadAt(payload, off+8); err != nil {
 		return nil, err
 	}
 	if !util.VerifyCRC32(payload, crc) {

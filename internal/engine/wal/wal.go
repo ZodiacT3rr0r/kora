@@ -106,7 +106,8 @@ func (w *WAL) Append(e *engine.Entry) (int64, error) {
 }
 
 // Recover reads all complete records from the WAL and returns reconstructed entries.
-// If the file ends with a partial/truncated record, recovery stops at the last good record.
+// If the file ends with a partial/truncated record, recovery truncates the torn tail
+// back to the last valid record boundary so subsequent appends never land past stray bytes.
 func (w *WAL) Recover() ([]*engine.Entry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -114,6 +115,9 @@ func (w *WAL) Recover() ([]*engine.Entry, error) {
 		return nil, err
 	}
 	var out []*engine.Entry
+	var lastValidOffset int64
+	truncatedTail := false
+
 	for {
 		var lenBuf [4]byte
 		_, err := io.ReadFull(w.f, lenBuf[:])
@@ -121,7 +125,8 @@ func (w *WAL) Recover() ([]*engine.Entry, error) {
 			break
 		}
 		if err == io.ErrUnexpectedEOF {
-			// partial length field -> stop
+			// partial length field -> stop and truncate torn tail
+			truncatedTail = true
 			break
 		}
 		if err != nil {
@@ -131,14 +136,16 @@ func (w *WAL) Recover() ([]*engine.Entry, error) {
 
 		var crcBuf [4]byte
 		if _, err := io.ReadFull(w.f, crcBuf[:]); err != nil {
-			// partial crc -> stop
+			// partial crc -> stop and truncate torn tail
+			truncatedTail = true
 			break
 		}
 		crc := binary.LittleEndian.Uint32(crcBuf[:])
 
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(w.f, payload); err != nil {
-			// partial payload -> stop
+			// partial payload -> stop and truncate torn tail
+			truncatedTail = true
 			break
 		}
 
@@ -150,12 +157,21 @@ func (w *WAL) Recover() ([]*engine.Entry, error) {
 			return nil, err
 		}
 		out = append(out, entry)
+		lastValidOffset += int64(4 + 4 + payloadLen)
 	}
-	// After successful scan, set offset to end of file (seek current)
-	off, err := w.f.Seek(0, io.SeekCurrent)
-	if err == nil {
-		w.offset = off
+
+	if truncatedTail {
+		if err := w.f.Truncate(lastValidOffset); err != nil {
+			return nil, err
+		}
+		if err := w.f.Sync(); err != nil {
+			return nil, err
+		}
 	}
+	if _, err := w.f.Seek(lastValidOffset, io.SeekStart); err != nil {
+		return nil, err
+	}
+	w.offset = lastValidOffset
 	return out, nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -294,4 +295,61 @@ func TestServerSetGetDelete(t *testing.T) {
 	}
 
 	server.Stop()
+}
+
+func TestRespParserRejectsInvalidNegativeLengths(t *testing.T) {
+	cases := []string{
+		"$-2\r\n",
+		"*-5\r\n",
+		"$-100\r\n",
+	}
+	for _, tc := range cases {
+		p := NewRespParser(strings.NewReader(tc))
+		if _, err := p.Parse(); err == nil {
+			t.Errorf("expected error for malformed RESP %q, got nil", tc)
+		}
+	}
+}
+
+func TestServerCaseInsensitiveEX(t *testing.T) {
+	tmpDir := t.TempDir()
+	engine, err := core.Open(core.Options{
+		DataDir:         tmpDir,
+		WALPath:         filepath.Join(tmpDir, "wal"),
+		ManifestPath:    filepath.Join(tmpDir, "manifest.json"),
+		MemTableMaxSize: 1024 * 100,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer engine.Close()
+
+	listener, _ := net.Listen("tcp", "127.0.0.1:0")
+	addr := listener.Addr().String()
+	listener.Close()
+
+	srv := NewServer(addr, engine)
+	go func() { _ = srv.Listen() }()
+	time.Sleep(80 * time.Millisecond)
+	defer srv.Stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	w := NewRespWriter(conn)
+	p := NewRespParser(conn)
+	_ = w.WriteArray([]*RespValue{
+		{Type: RespBulkString, Str: "SET"},
+		{Type: RespBulkString, Str: "ttlkey"},
+		{Type: RespBulkString, Str: "v"},
+		{Type: RespBulkString, Str: "ex"},
+		{Type: RespBulkString, Str: "1"},
+	})
+	resp, err := p.Parse()
+	if err != nil || resp.Str != "OK" {
+		t.Fatalf("SET lowercase ex failed: resp=%v err=%v", resp, err)
+	}
 }

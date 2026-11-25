@@ -93,24 +93,32 @@ func (p *RespParser) parseInteger() (*RespValue, error) {
 	return &RespValue{Type: RespInteger, Int: i}, nil
 }
 
+const (
+	maxBulkStringLen = 64 * 1024 * 1024 // 64 MiB safety cap
+	maxArrayElements = 1024 * 1024      // 1M elements safety cap
+)
+
 func (p *RespParser) parseBulkString() (*RespValue, error) {
 	line, err := p.reader.ReadString('\n')
 	if err != nil {
 		return nil, err
 	}
 	line = strings.TrimSuffix(line, "\r\n")
-	len, err := strconv.Atoi(line)
+	n, err := strconv.Atoi(line)
 	if err != nil {
 		return nil, err
 	}
-	if len == -1 {
+	if n == -1 {
 		return &RespValue{Type: RespBulkString, Null: true}, nil
 	}
-	data := make([]byte, len+2) // +2 for \r\n
+	if n < 0 || n > maxBulkStringLen {
+		return nil, fmt.Errorf("invalid bulk string length: %d", n)
+	}
+	data := make([]byte, n+2) // +2 for \r\n
 	if _, err := io.ReadFull(p.reader, data); err != nil {
 		return nil, err
 	}
-	return &RespValue{Type: RespBulkString, Str: string(data[:len])}, nil
+	return &RespValue{Type: RespBulkString, Str: string(data[:n])}, nil
 }
 
 func (p *RespParser) parseArray() (*RespValue, error) {
@@ -125,6 +133,9 @@ func (p *RespParser) parseArray() (*RespValue, error) {
 	}
 	if count == -1 {
 		return &RespValue{Type: RespArray, Null: true}, nil
+	}
+	if count < 0 || count > maxArrayElements {
+		return nil, fmt.Errorf("invalid array length: %d", count)
 	}
 	arr := make([]*RespValue, count)
 	for i := 0; i < count; i++ {
