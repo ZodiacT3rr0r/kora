@@ -33,34 +33,6 @@ DEL demo
 GET demo
 ```
 
-## Final Project Layout
-
-```text
-cmd/kora/main.go
-docs-kora/
-	01-implementation-playbook.md
-	02-architecture-and-technical-depth.md
-	03-project-explainer-for-interviews.md
-	07-day-5-bloom.md
-	08-days-6-7-sstable.md
-	10-day-10-engine-api.md
-	12-day-12-compaction-merger.md
-	13-day-13-compaction-scheduler.md
-	15-interviewer-runbook.md
-internal/engine/
-	entry.go
-	entry_test.go
-	bloom/
-	compaction/
-	core/
-	manifest/
-	memtable/
-	sstable/
-	wal/
-internal/server/
-internal/util/
-```
-
 ## Testing
 
 ```bash
@@ -76,10 +48,6 @@ The full suite covers:
 - manifest persistence
 - flush and compaction
 - RESP parsing and TCP server commands
-
-## Interview Runbook
-
-For a complete presenter-style walkthrough, use [docs-kora/15-interviewer-runbook.md](docs-kora/15-interviewer-runbook.md).
 
 ## Notes
 
